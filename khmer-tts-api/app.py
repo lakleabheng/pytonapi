@@ -1,6 +1,7 @@
 import os
 import uuid
 import asyncio
+import subprocess
 import edge_tts
 
 from flask import Flask, request, jsonify, send_from_directory
@@ -19,16 +20,18 @@ VOICES = {
 
 
 # =========================================================
-# TEXT CLEANING
+# CLEAN TEXT
 # =========================================================
 
 def clean_text(text):
+
     text = text.replace("\r\n", "\n")
     text = text.replace("\r", "\n")
 
     lines = []
 
     for line in text.split("\n"):
+
         line = " ".join(line.split())
 
         if line:
@@ -38,13 +41,10 @@ def clean_text(text):
 
 
 # =========================================================
-# SPLIT KHMER STORY INTO SENTENCES
+# SPLIT STORY INTO SENTENCES
 # =========================================================
 
 def split_sentences(text):
-    """
-    Split Khmer story into natural speaking chunks.
-    """
 
     text = clean_text(text)
 
@@ -52,23 +52,13 @@ def split_sentences(text):
         return []
 
     sentences = []
-
     current = ""
 
     for char in text:
 
         current += char
 
-        # Khmer sentence ending
         if char in ["។", "?", "!", "…"]:
-
-            if current.strip():
-                sentences.append(current.strip())
-
-            current = ""
-
-        # New paragraph
-        elif char == "\n":
 
             if current.strip():
                 sentences.append(current.strip())
@@ -82,7 +72,7 @@ def split_sentences(text):
 
 
 # =========================================================
-# DETERMINE PAUSE AFTER SENTENCE
+# PAUSE LENGTH
 # =========================================================
 
 def get_pause(sentence):
@@ -92,21 +82,17 @@ def get_pause(sentence):
     if not sentence:
         return 0.4
 
-    # Question
     if sentence.endswith("?"):
         return 0.75
 
-    # Excitement
     if sentence.endswith("!"):
         return 0.70
 
-    # Khmer full stop
-    if sentence.endswith("។"):
-        return 0.65
-
-    # Ellipsis
     if sentence.endswith("…"):
         return 0.90
+
+    if sentence.endswith("។"):
+        return 0.65
 
     return 0.45
 
@@ -136,6 +122,191 @@ async def generate_sentence(
 
 
 # =========================================================
+# CREATE SILENCE MP3 USING FFMPEG
+# =========================================================
+
+def create_silence(
+    duration,
+    output_path
+):
+
+    command = [
+        "ffmpeg",
+        "-y",
+
+        "-f",
+        "lavfi",
+
+        "-i",
+        "anullsrc=r=24000:cl=mono",
+
+        "-t",
+        str(duration),
+
+        "-c:a",
+        "libmp3lame",
+
+        "-b:a",
+        "128k",
+
+        output_path
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if result.returncode != 0:
+
+        raise Exception(
+            "FFmpeg silence error:\n" +
+            result.stderr
+        )
+
+
+# =========================================================
+# COMBINE MP3 FILES USING FFMPEG
+# =========================================================
+
+def combine_audio(
+    audio_files,
+    pauses,
+    output_path
+):
+
+    concat_files = []
+
+    temporary_files = []
+
+    try:
+
+        # ---------------------------------------------
+        # Create silence files
+        # ---------------------------------------------
+
+        for index, audio_file in enumerate(
+            audio_files
+        ):
+
+            concat_files.append(
+                audio_file
+            )
+
+            # Don't add unnecessary silence
+            # after the final sentence.
+            if index < len(audio_files) - 1:
+
+                pause_file = os.path.join(
+                    OUTPUT_DIR,
+                    f"pause_{uuid.uuid4().hex}.mp3"
+                )
+
+                create_silence(
+                    pauses[index],
+                    pause_file
+                )
+
+                concat_files.append(
+                    pause_file
+                )
+
+                temporary_files.append(
+                    pause_file
+                )
+
+        # ---------------------------------------------
+        # Create concat file
+        # ---------------------------------------------
+
+        concat_file = os.path.join(
+            OUTPUT_DIR,
+            f"concat_{uuid.uuid4().hex}.txt"
+        )
+
+        temporary_files.append(
+            concat_file
+        )
+
+        with open(
+            concat_file,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            for file_path in concat_files:
+
+                absolute_path = os.path.abspath(
+                    file_path
+                )
+
+                # FFmpeg concat syntax
+                f.write(
+                    "file '" +
+                    absolute_path.replace(
+                        "'",
+                        "'\\''"
+                    ) +
+                    "'\n"
+                )
+
+        # ---------------------------------------------
+        # Combine
+        # ---------------------------------------------
+
+        command = [
+            "ffmpeg",
+            "-y",
+
+            "-f",
+            "concat",
+
+            "-safe",
+            "0",
+
+            "-i",
+            concat_file,
+
+            "-c:a",
+            "libmp3lame",
+
+            "-b:a",
+            "192k",
+
+            output_path
+        ]
+
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        if result.returncode != 0:
+
+            raise Exception(
+                "FFmpeg combine error:\n" +
+                result.stderr
+            )
+
+    finally:
+
+        # ---------------------------------------------
+        # Delete temporary silence / concat files
+        # ---------------------------------------------
+
+        for file_path in temporary_files:
+
+            try:
+                os.remove(file_path)
+            except:
+                pass
+
+
+# =========================================================
 # GENERATE FULL STORY
 # =========================================================
 
@@ -144,28 +315,34 @@ async def generate_story(
     voice_name,
     rate,
     pitch,
-    volume,
-    output_dir
+    volume
 ):
 
     sentences = split_sentences(text)
 
     if not sentences:
-        raise Exception("No readable text found")
 
-    files = []
+        raise Exception(
+            "No readable text found"
+        )
 
-    for index, sentence in enumerate(sentences):
+    audio_files = []
 
-        filename = f"part_{uuid.uuid4().hex}.mp3"
+    for index, sentence in enumerate(
+        sentences
+    ):
+
+        filename = (
+            f"sentence_{uuid.uuid4().hex}.mp3"
+        )
 
         path = os.path.join(
-            output_dir,
+            OUTPUT_DIR,
             filename
         )
 
         print(
-            f"Generating sentence "
+            f"Generating "
             f"{index + 1}/{len(sentences)}: "
             f"{sentence}"
         )
@@ -179,44 +356,11 @@ async def generate_story(
             output_path=path
         )
 
-        files.append(path)
+        audio_files.append(path)
 
-    return files
-
-
-# =========================================================
-# COMBINE AUDIO
-# =========================================================
-
-def combine_audio(files, output_path, pauses):
-    """
-    Combine MP3 files using pydub.
-    """
-
-    from pydub import AudioSegment
-
-    final_audio = AudioSegment.empty()
-
-    for index, file_path in enumerate(files):
-
-        audio = AudioSegment.from_mp3(file_path)
-
-        final_audio += audio
-
-        if index < len(files):
-
-            pause_seconds = pauses[index]
-
-            silence = AudioSegment.silent(
-                duration=int(pause_seconds * 1000)
-            )
-
-            final_audio += silence
-
-    final_audio.export(
-        output_path,
-        format="mp3",
-        bitrate="192k"
+    return (
+        audio_files,
+        sentences
     )
 
 
@@ -239,7 +383,10 @@ def home():
 # VOICES
 # =========================================================
 
-@app.route("/api/voices", methods=["GET"])
+@app.route(
+    "/api/voices",
+    methods=["GET"]
+)
 def get_voices():
 
     return jsonify({
@@ -252,7 +399,10 @@ def get_voices():
 # GENERATE MP3
 # =========================================================
 
-@app.route("/api/generate", methods=["POST"])
+@app.route(
+    "/api/generate",
+    methods=["POST"]
+)
 def generate_mp3():
 
     try:
@@ -300,7 +450,7 @@ def generate_mp3():
             voice_name = VOICES["female"]
 
         # =================================================
-        # RATE
+        # SPEED
         # =================================================
 
         try:
@@ -316,7 +466,6 @@ def generate_mp3():
 
             speed = 0.95
 
-        # Storytelling speed
         speed = max(
             0.75,
             min(1.20, speed)
@@ -328,11 +477,15 @@ def generate_mp3():
 
         if rate_percent >= 0:
 
-            rate = f"+{rate_percent}%"
+            rate = (
+                f"+{rate_percent}%"
+            )
 
         else:
 
-            rate = f"{rate_percent}%"
+            rate = (
+                f"{rate_percent}%"
+            )
 
         # =================================================
         # PITCH
@@ -362,11 +515,15 @@ def generate_mp3():
 
         if pitch_hz >= 0:
 
-            pitch = f"+{pitch_hz}Hz"
+            pitch = (
+                f"+{pitch_hz}Hz"
+            )
 
         else:
 
-            pitch = f"{pitch_hz}Hz"
+            pitch = (
+                f"{pitch_hz}Hz"
+            )
 
         # =================================================
         # VOLUME
@@ -396,20 +553,45 @@ def generate_mp3():
 
         if volume_percent >= 0:
 
-            volume = f"+{volume_percent}%"
+            volume = (
+                f"+{volume_percent}%"
+            )
 
         else:
 
-            volume = f"{volume_percent}%"
+            volume = (
+                f"{volume_percent}%"
+            )
 
         # =================================================
-        # FILE NAMES
+        # GENERATE SENTENCES
         # =================================================
 
-        story_id = uuid.uuid4().hex
+        audio_files, sentences = asyncio.run(
+            generate_story(
+                text=text,
+                voice_name=voice_name,
+                rate=rate,
+                pitch=pitch,
+                volume=volume
+            )
+        )
+
+        # =================================================
+        # PAUSES
+        # =================================================
+
+        pauses = [
+            get_pause(sentence)
+            for sentence in sentences
+        ]
+
+        # =================================================
+        # FINAL FILE
+        # =================================================
 
         final_filename = (
-            f"{story_id}.mp3"
+            f"{uuid.uuid4().hex}.mp3"
         )
 
         final_path = os.path.join(
@@ -418,56 +600,24 @@ def generate_mp3():
         )
 
         # =================================================
-        # GENERATE SENTENCES
-        # =================================================
-
-        sentence_files = asyncio.run(
-            generate_story(
-                text=text,
-                voice_name=voice_name,
-                rate=rate,
-                pitch=pitch,
-                volume=volume,
-                output_dir=OUTPUT_DIR
-            )
-        )
-
-        # =================================================
-        # PAUSES
-        # =================================================
-
-        sentences = split_sentences(text)
-
-        pauses = []
-
-        for sentence in sentences:
-
-            pauses.append(
-                get_pause(sentence)
-            )
-
-        # =================================================
         # COMBINE
         # =================================================
 
         combine_audio(
-            files=sentence_files,
-            output_path=final_path,
-            pauses=pauses
+            audio_files=audio_files,
+            pauses=pauses,
+            output_path=final_path
         )
 
         # =================================================
-        # DELETE TEMP FILES
+        # DELETE SENTENCE FILES
         # =================================================
 
-        for file_path in sentence_files:
+        for file_path in audio_files:
 
             try:
-
                 os.remove(file_path)
-
             except:
-
                 pass
 
         # =================================================
@@ -475,8 +625,7 @@ def generate_mp3():
         # =================================================
 
         base_url = (
-            request.host_url
-            .rstrip("/")
+            request.host_url.rstrip("/")
         )
 
         audio_url = (
@@ -489,12 +638,16 @@ def generate_mp3():
             f"{final_filename}"
         )
 
+        # =================================================
+        # RESPONSE
+        # =================================================
+
         return jsonify({
 
             "success": True,
 
             "message":
-                "Natural Khmer story MP3 generated successfully",
+                "Natural Khmer MP3 generated successfully",
 
             "filename":
                 final_filename,
@@ -534,11 +687,12 @@ def generate_mp3():
 
             "error":
                 str(e)
+
         }), 500
 
 
 # =========================================================
-# PLAY AUDIO
+# AUDIO
 # =========================================================
 
 @app.route(
@@ -574,7 +728,7 @@ def download(filename):
 
 
 # =========================================================
-# RUN
+# START SERVER
 # =========================================================
 
 if __name__ == "__main__":
