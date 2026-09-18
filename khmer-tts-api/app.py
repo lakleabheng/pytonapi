@@ -80,21 +80,21 @@ def get_pause(sentence):
     sentence = sentence.strip()
 
     if not sentence:
-        return 0.4
+        return 0.1
 
     if sentence.endswith("?"):
-        return 0.75
+        return 0.1
 
     if sentence.endswith("!"):
-        return 0.70
+        return 0.1
 
     if sentence.endswith("…"):
-        return 0.90
+        return 0.09
 
     if sentence.endswith("។"):
-        return 0.65
+        return 0.05
 
-    return 0.45
+    return 0.1
 
 
 # =========================================================
